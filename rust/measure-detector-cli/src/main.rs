@@ -6,7 +6,8 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
-use image::{imageops::FilterType, DynamicImage, ImageBuffer, Rgb, RgbImage};
+use fast_image_resize as fir;
+use image::RgbImage;
 use ort::session::Session;
 use ort::value::{Tensor, ValueType};
 use serde::Serialize;
@@ -66,6 +67,18 @@ struct Args {
     /// Warmup iterations per image for benchmark mode.
     #[arg(long, default_value_t = 5)]
     warmup: usize,
+
+    /// Include preprocessing / inference / postprocessing timing in benchmark mode.
+    #[arg(long)]
+    bench_breakdown: bool,
+
+    /// ONNX Runtime intra-op thread count.
+    #[arg(long, default_value_t = 2)]
+    intra_threads: usize,
+
+    /// ONNX Runtime inter-op thread count.
+    #[arg(long, default_value_t = 1)]
+    inter_threads: usize,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -117,11 +130,21 @@ struct Detector {
 }
 
 impl Detector {
-    fn new(model: Option<&Path>, conf: f32) -> Result<Self> {
+    fn new(model: Option<&Path>, conf: f32, intra_threads: usize, inter_threads: usize) -> Result<Self> {
         init_embedded_ort()?;
 
         let mut builder = Session::builder()
             .map_err(|e| anyhow::anyhow!("failed to create ONNX Runtime session builder: {e}"))?;
+        if intra_threads > 0 {
+            builder = builder
+                .with_intra_threads(intra_threads)
+                .map_err(|e| anyhow::anyhow!("failed to configure ONNX Runtime intra-op threads: {e}"))?;
+        }
+        if inter_threads > 0 {
+            builder = builder
+                .with_inter_threads(inter_threads)
+                .map_err(|e| anyhow::anyhow!("failed to configure ONNX Runtime inter-op threads: {e}"))?;
+        }
         let session = if let Some(model) = model {
             if !model.exists() {
                 bail!("model not found: {}", model.display());
@@ -145,7 +168,21 @@ impl Detector {
     }
 
     fn predict(&mut self, image: &RgbImage, expand: bool, trim: bool, auto: bool) -> Result<(Vec<Measure>, String, f32)> {
-        let (tensor, ratio, pad_x, pad_y) = self.prepare(image);
+        self.predict_inner(image, expand, trim, auto).map(|(measures, page_type, type_conf, _)| (measures, page_type, type_conf))
+    }
+
+    fn predict_inner(
+        &mut self,
+        image: &RgbImage,
+        expand: bool,
+        trim: bool,
+        auto: bool,
+    ) -> Result<(Vec<Measure>, String, f32, Option<(f64, f64, f64)>)> {
+        let t0 = Instant::now();
+        let (tensor, ratio, pad_x, pad_y) = self.prepare(image)?;
+        let prep_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        let t1 = Instant::now();
         let input = Tensor::from_array((
             [1usize, 3, self.imgsz as usize, self.imgsz as usize],
             tensor.into_boxed_slice(),
@@ -158,7 +195,9 @@ impl Detector {
         let (_shape, output) = outputs[0]
             .try_extract_tensor::<f32>()
             .map_err(|e| anyhow::anyhow!("failed to extract output tensor: {e}"))?;
+        let infer_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
+        let t2 = Instant::now();
         let (orig_w, orig_h) = image.dimensions();
         let mut measures = Vec::new();
         for row in output.chunks_exact(6) {
@@ -190,40 +229,41 @@ impl Detector {
         let (page_type, type_conf) = detect_page_type(&measures);
         let mut measures = remove_overlapping_measures(&measures, 0.7);
         unify_measures(&mut measures, &page_type, expand, trim, auto);
-        Ok((measures, page_type, type_conf))
+        let post_ms = t2.elapsed().as_secs_f64() * 1000.0;
+        Ok((measures, page_type, type_conf, Some((prep_ms, infer_ms, post_ms))))
     }
 
-    fn prepare(&self, image: &RgbImage) -> (Vec<f32>, f32, f32, f32) {
+    fn prepare(&self, image: &RgbImage) -> Result<(Vec<f32>, f32, f32, f32)> {
         let (w, h) = image.dimensions();
         let ratio = (self.imgsz as f32 / w as f32).min(self.imgsz as f32 / h as f32);
         let new_w = (w as f32 * ratio).round() as u32;
         let new_h = (h as f32 * ratio).round() as u32;
-        let resized = DynamicImage::ImageRgb8(image.clone())
-            .resize_exact(new_w, new_h, FilterType::Triangle)
-            .to_rgb8();
+        let mut resized = fir::images::Image::new(new_w, new_h, fir::PixelType::U8x3);
+        let options = fir::ResizeOptions::new()
+            .resize_alg(fir::ResizeAlg::Interpolation(fir::FilterType::Bilinear));
+        fir::Resizer::new()
+            .resize(image, &mut resized, &options)
+            .map_err(|err| anyhow::anyhow!("failed to resize image: {err}"))?;
         let pad_x = ((self.imgsz - new_w) as f32 / 2.0 - 0.1).round().max(0.0);
         let pad_y = ((self.imgsz - new_h) as f32 / 2.0 - 0.1).round().max(0.0);
         let left = pad_x as u32;
         let top = pad_y as u32;
 
-        let canvas = ImageBuffer::from_pixel(self.imgsz, self.imgsz, Rgb([114, 114, 114]));
         let side = self.imgsz as usize;
         let plane = side * side;
-        let mut arr = vec![0.0_f32; 3 * plane];
-        for (x, y, p) in canvas.enumerate_pixels() {
-            let pixel = if x >= left && x < left + new_w && y >= top && y < top + new_h {
-                resized.get_pixel(x - left, y - top)
-            } else {
-                p
-            };
-            let yi = y as usize;
-            let xi = x as usize;
-            let idx = yi * side + xi;
-            arr[idx] = pixel[0] as f32 / 255.0;
-            arr[plane + idx] = pixel[1] as f32 / 255.0;
-            arr[2 * plane + idx] = pixel[2] as f32 / 255.0;
+        let fill = 114.0_f32 / 255.0;
+        let mut arr = vec![fill; 3 * plane];
+        for (src_row, row) in resized.buffer().chunks_exact(new_w as usize * 3).enumerate() {
+            let dst_y = src_row + top as usize;
+            let dst_base = dst_y * side + left as usize;
+            for (src_x, pixel) in row.chunks_exact(3).enumerate() {
+                let idx = dst_base + src_x;
+                arr[idx] = pixel[0] as f32 / 255.0;
+                arr[plane + idx] = pixel[1] as f32 / 255.0;
+                arr[2 * plane + idx] = pixel[2] as f32 / 255.0;
+            }
         }
-        (arr, ratio, pad_x, pad_y)
+        Ok((arr, ratio, pad_x, pad_y))
     }
 }
 
@@ -235,7 +275,7 @@ fn main() -> Result<()> {
     }
 
     let start = Instant::now();
-    let mut detector = Detector::new(args.model.as_deref(), args.conf)?;
+    let mut detector = Detector::new(args.model.as_deref(), args.conf, args.intra_threads, args.inter_threads)?;
     if let Some(runs) = args.bench_runs {
         return run_benchmark(&mut detector, &paths, &args, runs);
     }
@@ -298,12 +338,22 @@ fn run_benchmark(detector: &mut Detector, paths: &[PathBuf], args: &Args, runs: 
     }
 
     let mut times = Vec::with_capacity(runs * images.len());
+    let mut prep_times = Vec::with_capacity(runs * images.len());
+    let mut infer_times = Vec::with_capacity(runs * images.len());
+    let mut post_times = Vec::with_capacity(runs * images.len());
     let mut n_measures = 0usize;
     for _ in 0..runs {
         for (_, image) in &images {
             let start = Instant::now();
-            let (measures, _, _) = detector.predict(&image.rgb, args.expand, args.trim, args.auto)?;
+            let (measures, _, _, breakdown) = detector.predict_inner(&image.rgb, args.expand, args.trim, args.auto)?;
             times.push(start.elapsed().as_secs_f64() * 1000.0);
+            if args.bench_breakdown {
+                if let Some((prep, infer, post)) = breakdown {
+                    prep_times.push(prep);
+                    infer_times.push(infer);
+                    post_times.push(post);
+                }
+            }
             n_measures = measures.len();
         }
     }
@@ -320,6 +370,14 @@ fn run_benchmark(detector: &mut Detector, paths: &[PathBuf], args: &Args, runs: 
     println!("p95_ms={p95:.1}");
     println!("min_ms={:.1}", times[0]);
     println!("max_ms={:.1}", times[times.len() - 1]);
+    if args.bench_breakdown {
+        prep_times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+        infer_times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+        post_times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+        println!("prep_median_ms={:.1}", percentile(&prep_times, 0.50));
+        println!("infer_median_ms={:.1}", percentile(&infer_times, 0.50));
+        println!("post_median_ms={:.1}", percentile(&post_times, 0.50));
+    }
     Ok(())
 }
 
