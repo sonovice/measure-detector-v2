@@ -53,3 +53,18 @@ The script runs Ultralytics ONNX export with simplification/slimming where avail
 ```shell
 measure-detector-v2-bench /path/to/page.jpg --runs 50 --warmup 5
 ```
+
+## Standalone Rust CLI
+
+The Rust CLI embeds both the optimized ONNX model and the ONNX Runtime CPU shared library into one executable. At runtime it extracts the ORT library to a temp cache and loads the embedded model from memory.
+
+```shell
+cd rust/measure-detector-cli
+cargo build --release
+./target/release/measure-detector-v2 --pretty /path/to/page.jpg
+./target/release/measure-detector-v2 --format mei --pretty /path/to/pages -o measures.mei
+```
+
+Inputs can be individual image files, folders, or a mix of both. Folders are scanned recursively unless `--no-recursive` is set. Supported image extensions are `jpg`, `jpeg`, `png`, `tif`, `tiff`, and `webp`.
+
+The embedded model is used by default. For development comparisons, pass `--model /path/to/model.onnx` to override it.

@@ -1,1 +1,2 @@
 models/*.onnx binary
+rust/measure-detector-cli/assets/*.so* binary

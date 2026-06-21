@@ -9,3 +9,5 @@ build/
 *.egg-info/
 models/*.pt
 models/*.tmp.onnx
+target/
+rust/measure-detector-cli/target/
