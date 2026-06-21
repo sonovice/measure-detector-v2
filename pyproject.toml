@@ -1,0 +1,45 @@
+[project]
+name = "measure-detector-v2"
+version = "2.0.0"
+description = "CPU-only ONNX Runtime measure detector service"
+authors = [
+    { name = "Simon Waloschek", email = "waloschek@pm.me" },
+]
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.117.1",
+    "gunicorn>=23.0.0",
+    "numpy>=2.0",
+    "onnx>=1.17",
+    "onnxruntime>=1.20",
+    "opencv-python-headless>=4.10",
+    "pillow>=11.0",
+    "python-multipart>=0.0.20",
+    "uvicorn>=0.32.0",
+]
+
+[project.optional-dependencies]
+optimize = [
+    "onnxsim>=0.4.36",
+    "onnxslim>=0.1.40",
+]
+export = [
+    "ultralytics>=8.4.43",
+]
+
+[project.scripts]
+measure-detector-v2 = "measure_detector_v2.server:main"
+measure-detector-v2-bench = "measure_detector_v2.bench:main"
+measure-detector-v2-optimize = "measure_detector_v2.optimize_onnx:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["measure_detector_v2*"]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
