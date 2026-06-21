@@ -58,6 +58,14 @@ struct Args {
     /// Do not recurse into folders.
     #[arg(long)]
     no_recursive: bool,
+
+    /// Run a steady-state benchmark instead of writing detections.
+    #[arg(long)]
+    bench_runs: Option<usize>,
+
+    /// Warmup iterations per image for benchmark mode.
+    #[arg(long, default_value_t = 5)]
+    warmup: usize,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -112,11 +120,8 @@ impl Detector {
     fn new(model: Option<&Path>, conf: f32) -> Result<Self> {
         init_embedded_ort()?;
 
-        let builder = Session::builder()
+        let mut builder = Session::builder()
             .map_err(|e| anyhow::anyhow!("failed to create ONNX Runtime session builder: {e}"))?;
-        let mut builder = builder
-            .with_intra_threads(num_cpus_hint())
-            .map_err(|e| anyhow::anyhow!("failed to configure ONNX Runtime threads: {e}"))?;
         let session = if let Some(model) = model {
             if !model.exists() {
                 bail!("model not found: {}", model.display());
@@ -231,6 +236,10 @@ fn main() -> Result<()> {
 
     let start = Instant::now();
     let mut detector = Detector::new(args.model.as_deref(), args.conf)?;
+    if let Some(runs) = args.bench_runs {
+        return run_benchmark(&mut detector, &paths, &args, runs);
+    }
+
     let mut results = Vec::with_capacity(paths.len());
 
     for path in paths {
@@ -271,6 +280,52 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn run_benchmark(detector: &mut Detector, paths: &[PathBuf], args: &Args, runs: usize) -> Result<()> {
+    if runs == 0 {
+        bail!("--bench-runs must be greater than zero");
+    }
+    let mut images = Vec::with_capacity(paths.len());
+    for path in paths {
+        images.push((path, load_image(path)?));
+    }
+
+    for _ in 0..args.warmup {
+        for (_, image) in &images {
+            let _ = detector.predict(&image.rgb, args.expand, args.trim, args.auto)?;
+        }
+    }
+
+    let mut times = Vec::with_capacity(runs * images.len());
+    let mut n_measures = 0usize;
+    for _ in 0..runs {
+        for (_, image) in &images {
+            let start = Instant::now();
+            let (measures, _, _) = detector.predict(&image.rgb, args.expand, args.trim, args.auto)?;
+            times.push(start.elapsed().as_secs_f64() * 1000.0);
+            n_measures = measures.len();
+        }
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    let mean = times.iter().sum::<f64>() / times.len() as f64;
+    let median = percentile(&times, 0.50);
+    let p95 = percentile(&times, 0.95);
+    println!("images={}", images.len());
+    println!("runs={runs}");
+    println!("samples={}", times.len());
+    println!("measures_last={n_measures}");
+    println!("mean_ms={mean:.1}");
+    println!("median_ms={median:.1}");
+    println!("p95_ms={p95:.1}");
+    println!("min_ms={:.1}", times[0]);
+    println!("max_ms={:.1}", times[times.len() - 1]);
+    Ok(())
+}
+
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    let idx = ((sorted.len() - 1) as f64 * p).round() as usize;
+    sorted[idx]
 }
 
 fn collect_inputs(inputs: &[PathBuf], recursive: bool) -> Result<Vec<PathBuf>> {
@@ -565,8 +620,4 @@ fn round3(v: f32) -> f32 {
 
 fn round5(v: f32) -> f32 {
     (v * 100000.0).round() / 100000.0
-}
-
-fn num_cpus_hint() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
