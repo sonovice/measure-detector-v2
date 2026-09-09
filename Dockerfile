@@ -14,7 +14,7 @@ ENV PYTHONUNBUFFERED=1 \
     ORT_INTER_OP_NUM_THREADS=1
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl ca-certificates libglib2.0-0 libgomp1 && \
+    apt-get install -y --no-install-recommends poppler-utils curl ca-certificates libglib2.0-0 libgomp1 && \
     rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml README.md ./

@@ -1,3 +1,9 @@
+mod inputs;
+mod progress;
+mod runtime;
+mod reading_order;
+mod xfdf;
+
 use std::cmp::Ordering;
 use std::fs;
 use std::io::{self, Write};
@@ -14,17 +20,16 @@ use serde::Serialize;
 use walkdir::WalkDir;
 
 const CLASS_NAMES: [&str; 2] = ["handwritten", "typeset"];
-const EMBEDDED_MODEL: &[u8] = include_bytes!("../../../models/model.optimized.onnx");
-const EMBEDDED_ORT: &[u8] = include_bytes!("../assets/libonnxruntime.so.1.27.0");
+use runtime::EMBEDDED_MODEL;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "CPU-only ONNX measure detector CLI")]
 struct Args {
-    /// Image files and/or folders. Folders are scanned recursively by default.
+    /// Image files, PDFs and/or folders. Folders are scanned recursively by default.
     #[arg(required = true)]
     inputs: Vec<PathBuf>,
 
-    /// Optional ONNX model path. The optimized detector model is embedded by default.
+    /// Optional ONNX model path. A detector model for the target platform is embedded by default.
     #[arg(long)]
     model: Option<PathBuf>,
 
@@ -52,9 +57,13 @@ struct Args {
     #[arg(long)]
     auto: bool,
 
-    /// Pretty-print JSON or MEI.
+    /// Pretty-print JSON, MEI or XFDF.
     #[arg(long)]
     pretty: bool,
+
+    /// Hide PDF progress bars (also hidden automatically when stderr is not a terminal).
+    #[arg(long)]
+    no_progress: bool,
 
     /// Do not recurse into folders.
     #[arg(long)]
@@ -85,6 +94,7 @@ struct Args {
 enum OutputFormat {
     Json,
     Mei,
+    Xfdf,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -106,6 +116,10 @@ struct Measure {
 #[derive(Debug, Serialize)]
 struct ImageResult {
     filename: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    page: Option<usize>,
+    #[serde(skip)]
+    dimensions: (u32, u32),
     #[serde(rename = "type")]
     page_type: String,
     type_confidence: f32,
@@ -120,6 +134,7 @@ struct JsonResponse {
 
 struct LoadedImage {
     rgb: RgbImage,
+    page: Option<usize>,
 }
 
 struct Detector {
@@ -131,7 +146,7 @@ struct Detector {
 
 impl Detector {
     fn new(model: Option<&Path>, conf: f32, intra_threads: usize, inter_threads: usize) -> Result<Self> {
-        init_embedded_ort()?;
+        runtime::init()?;
 
         let mut builder = Session::builder()
             .map_err(|e| anyhow::anyhow!("failed to create ONNX Runtime session builder: {e}"))?;
@@ -225,7 +240,7 @@ impl Detector {
             });
         }
 
-        measures.sort_by(cmp_measure_bboxes);
+        reading_order::sort(&mut measures);
         let (page_type, type_conf) = detect_page_type(&measures);
         let mut measures = remove_overlapping_measures(&measures, 0.7);
         unify_measures(&mut measures, &page_type, expand, trim, auto);
@@ -269,13 +284,26 @@ impl Detector {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let paths = collect_inputs(&args.inputs, !args.no_recursive)?;
+    let paths = progress::stage(!args.no_progress, "Scanning input files", || {
+        collect_inputs(&args.inputs, !args.no_recursive)
+    })?;
     if paths.is_empty() {
-        bail!("no supported image files found");
+        bail!("no supported image or PDF files found");
     }
 
+    let xfdf_geometry = if matches!(args.format, OutputFormat::Xfdf) {
+        xfdf::validate_input(&paths)?;
+        Some(progress::stage(!args.no_progress, "Reading PDF geometry for XFDF", || {
+            xfdf::pdf_geometry(&paths[0])
+        })?)
+    } else {
+        None
+    };
+    let xfdf_filename = paths[0].to_string_lossy().to_string();
     let start = Instant::now();
-    let mut detector = Detector::new(args.model.as_deref(), args.conf, args.intra_threads, args.inter_threads)?;
+    let mut detector = progress::stage(!args.no_progress, "Loading ONNX Runtime and detector model", || {
+        Detector::new(args.model.as_deref(), args.conf, args.intra_threads, args.inter_threads)
+    })?;
     if let Some(runs) = args.bench_runs {
         return run_benchmark(&mut detector, &paths, &args, runs);
     }
@@ -283,16 +311,25 @@ fn main() -> Result<()> {
     let mut results = Vec::with_capacity(paths.len());
 
     for path in paths {
-        let image = load_image(&path)?;
-        let (measures, page_type, type_confidence) =
-            detector.predict(&image.rgb, args.expand, args.trim, args.auto)
-                .with_context(|| format!("inference failed for {}", path.display()))?;
-        results.push(ImageResult {
-            filename: path.to_string_lossy().to_string(),
-            page_type,
-            type_confidence: round3(type_confidence),
-            measures,
-        });
+        let pages = progress::stage(!args.no_progress, &format!("Reading input metadata: {}", path.display()), || {
+            inputs::load_pages(&path)
+        })?;
+        let progress = progress::PdfProgress::new(&path, pages.page_count(), !args.no_progress, "Detecting");
+        for image in pages {
+            let image = image?;
+            let (measures, page_type, type_confidence) =
+                detector.predict(&image.rgb, args.expand, args.trim, args.auto)
+                    .with_context(|| format!("inference failed for {} page {:?}", path.display(), image.page))?;
+            results.push(ImageResult {
+                filename: path.to_string_lossy().to_string(),
+                page: image.page,
+                dimensions: image.rgb.dimensions(),
+                page_type,
+                type_confidence: round3(type_confidence),
+                measures,
+            });
+            progress.page_completed();
+        }
     }
 
     let process_time = start.elapsed().as_millis();
@@ -306,6 +343,9 @@ fn main() -> Result<()> {
             }
         }
         OutputFormat::Mei => write_mei(&results, args.pretty)?,
+        OutputFormat::Xfdf => xfdf::write_xfdf(
+            &xfdf_filename, &results, xfdf_geometry.as_deref().context("Missing PDF geometry")?, args.pretty,
+        )?,
     };
 
     match args.output {
@@ -328,7 +368,14 @@ fn run_benchmark(detector: &mut Detector, paths: &[PathBuf], args: &Args, runs: 
     }
     let mut images = Vec::with_capacity(paths.len());
     for path in paths {
-        images.push((path, load_image(path)?));
+        let pages = progress::stage(!args.no_progress, &format!("Reading input metadata: {}", path.display()), || {
+            inputs::load_pages(path)
+        })?;
+        let progress = progress::PdfProgress::new(path, pages.page_count(), !args.no_progress, "Loading");
+        for image in pages {
+            images.push((path, image?));
+            progress.page_completed();
+        }
     }
 
     for _ in 0..args.warmup {
@@ -390,21 +437,21 @@ fn collect_inputs(inputs: &[PathBuf], recursive: bool) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     for input in inputs {
         if input.is_file() {
-            if is_image_path(input) {
+            if is_supported_path(input) {
                 out.push(input.clone());
             }
         } else if input.is_dir() {
             if recursive {
                 for entry in WalkDir::new(input).follow_links(true).into_iter().filter_map(Result::ok) {
                     let path = entry.path();
-                    if path.is_file() && is_image_path(path) {
+                    if path.is_file() && is_supported_path(path) {
                         out.push(path.to_path_buf());
                     }
                 }
             } else {
                 for entry in fs::read_dir(input)? {
                     let path = entry?.path();
-                    if path.is_file() && is_image_path(&path) {
+                    if path.is_file() && is_supported_path(&path) {
                         out.push(path);
                     }
                 }
@@ -418,59 +465,16 @@ fn collect_inputs(inputs: &[PathBuf], recursive: bool) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-fn is_image_path(path: &Path) -> bool {
+fn is_supported_path(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase()).as_deref(),
-        Some("jpg" | "jpeg" | "png" | "tif" | "tiff" | "webp")
+        Some("jpg" | "jpeg" | "png" | "tif" | "tiff" | "webp" | "pdf")
     )
 }
 
 fn load_image(path: &Path) -> Result<LoadedImage> {
     let img = image::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    Ok(LoadedImage { rgb: img.to_rgb8() })
-}
-
-fn init_embedded_ort() -> Result<()> {
-    let dir = std::env::temp_dir().join("measure-detector-v2-cli").join("onnxruntime-1.27.0");
-    fs::create_dir_all(&dir)?;
-    let lib_path = dir.join("libonnxruntime.so.1.27.0");
-
-    let needs_write = match fs::metadata(&lib_path) {
-        Ok(meta) => meta.len() != EMBEDDED_ORT.len() as u64,
-        Err(_) => true,
-    };
-    if needs_write {
-        fs::write(&lib_path, EMBEDDED_ORT)?;
-    }
-
-    let _committed = ort::init_from(&lib_path)
-        .map_err(|e| anyhow::anyhow!("failed to initialize ONNX Runtime from embedded library: {e}"))?
-        .commit();
-    Ok(())
-}
-
-fn cmp_measure_bboxes(a: &Measure, b: &Measure) -> Ordering {
-    let a = &a.bbox;
-    let b = &b.bbox;
-    if a.x1 >= b.x1 && a.y1 >= b.y1 {
-        return Ordering::Greater;
-    }
-    if a.x1 < b.x1 && a.y1 < b.y1 {
-        return Ordering::Less;
-    }
-    let denom = (a.y2 - a.y1).min(b.y2 - b.y1);
-    let overlap_y = if denom > 0.0 {
-        (a.y2 - b.y1).min(b.y2 - a.y1) / denom
-    } else {
-        0.0
-    };
-    if overlap_y >= 0.5 {
-        if a.x1 < b.x1 { Ordering::Less } else { Ordering::Greater }
-    } else if a.x1 < b.x1 {
-        Ordering::Greater
-    } else {
-        Ordering::Less
-    }
+    Ok(LoadedImage { rgb: img.to_rgb8(), page: None })
 }
 
 fn get_geometry(a: &BBox, b: &BBox) -> (f32, f32, f32) {
@@ -634,14 +638,18 @@ fn write_mei(results: &[ImageResult], pretty: bool) -> Result<String> {
 
     measure_idx = 1;
     for (page_idx, result) in results.iter().enumerate() {
-        let (width, height) = image_dimensions(Path::new(&result.filename)).unwrap_or((0, 0));
+        let (width, height) = result.dimensions;
+        let target = match result.page {
+            Some(page) => format!("{}#page={page}", result.filename),
+            None => result.filename.clone(),
+        };
         out.push_str(&format!(
             r#"{}<surface xml:id="surface_{}" n="{}" ulx="0" uly="0" lrx="{}" lry="{}">{}"#,
             indent(2), page_idx + 1, page_idx + 1, width.saturating_sub(1), height.saturating_sub(1), nl
         ));
         out.push_str(&format!(
             r#"{}<graphic xml:id="graphic_{}" target="{}" width="{}px" height="{}px" />{}"#,
-            indent(3), page_idx + 1, xml_escape(&result.filename), width, height, nl
+            indent(3), page_idx + 1, xml_escape(&target), width, height, nl
         ));
         for measure in &result.measures {
             let x1 = (measure.bbox.x1 * width as f32).round() as u32;
@@ -658,10 +666,6 @@ fn write_mei(results: &[ImageResult], pretty: bool) -> Result<String> {
     }
     out.push_str(&format!("{}</facsimile>{nl}</mei>", indent(1)));
     Ok(out)
-}
-
-fn image_dimensions(path: &Path) -> Option<(u32, u32)> {
-    image::image_dimensions(path).ok()
 }
 
 fn xml_escape(s: &str) -> String {

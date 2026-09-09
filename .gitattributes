@@ -1,2 +1,4 @@
 models/*.onnx binary
 rust/measure-detector-cli/assets/*.so* binary
+rust/measure-detector-cli/assets/*.dylib binary
+tests/fixtures/*.pdf binary
